@@ -1,0 +1,148 @@
+<?php
+/*****************************************************************/
+/*** Auteur   : Emmanuel L.    Date    : 02/04/2026     ***/
+/*** Fichier  : module1search.phpi    Version : 1.0.0          ***/
+/*** Titre    : Formulaire onboarding (tableau principal)      ***/
+/*****************************************************************/
+/*
+  Appelé en AJAX par updateSearch() (/js/edit.js) pour construire le tableau
+  des employés. Fournit les boutons "+ Onboarder" / "+ Software" qui
+  ouvrent module1edit.phpi via loadModalEdit() (/js/app.js).
+*/
+    require(realpath($_SERVER["DOCUMENT_ROOT"]) . '/app/init.phpi');
+
+	if(isGrantedAccess($_SERVER['PHP_SELF']))
+	{
+?>
+
+<script type="text/javascript" src="/js/edit.js?v=@Function.GUID~"></script>
+
+<?php
+	// Récupération de la chaîne de recherche saisie par l'utilisateur
+	if(isset($_GET['search']))
+		$sSearchText = $_GET['search'];
+	else
+		$sSearchText = '';
+
+	$oDB = new cSQLServer();
+	$oDB->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+	$oDB->connectSqlDB();
+
+	if($oDB->isConnected())
+	{
+		// Construction dynamique de la clause WHERE avec requête paramétrée
+		$sWhere = '';
+		$aSearchParams = array();
+		if($sSearchText != '')
+		{
+			$sSearchParam = '%' . $sSearchText . '%';
+			$sWhere = " WHERE o.LastName LIKE ? OR o.FirstName LIKE ? OR o.Company LIKE ? OR o.Team LIKE ? OR o.Mail LIKE ? OR o.AccountName LIKE ?";
+			$aSearchParams = array($sSearchParam, $sSearchParam, $sSearchParam, $sSearchParam, $sSearchParam, $sSearchParam);
+		}
+
+		// Requête SQL : Récupération des employés depuis la table autonome dbo.Onboarder
+		$sQuery = "SELECT o.id_employee, o.LastName, o.FirstName, o.AccountName, o.Company, o.Initials, o.JobTitle, "
+				. "       o.Team AS TeamName, o.Manager, o.Mail "
+				. "FROM dbo.Onboarder o"
+				. $sWhere
+				. " ORDER BY o.FirstName, o.LastName";
+		$oOnboarderResult = empty($aSearchParams) ? sqlsrv_query($oDB->DBHandle(), $sQuery) : sqlsrv_query($oDB->DBHandle(), $sQuery, $aSearchParams);
+		if($oOnboarderResult === false)
+		{
+			$aErrors = sqlsrv_errors();
+			echo '<div class="noresult">SQL Error: ' . htmlspecialchars($aErrors[0]['message'] ?? 'unknown error') . '</div>';
+			$oDB->disconnectSqlDB();
+			exit;
+		}
+
+		echo '<div class="tableFixHead table-margin-top20 overflow-auto" style="height:70vh;">';
+			echo '<table class="table table-striped table-hover table-bordered">';
+				echo '<thead>';
+					echo '<tr>';
+						echo '<th class="th">First Name</th>';
+						echo '<th class="th">Last Name</th>';
+						echo '<th class="th">Account Name</th>';
+						echo '<th class="th">Company</th>';
+						echo '<th class="th">Initials</th>';
+						echo '<th class="th">Job Title</th>';
+						echo '<th class="th">Team</th>';
+						echo '<th class="th">Manager</th>';
+						echo '<th class="th">Mail</th>';
+						echo '<th class="th">Software</th>';
+					echo '</tr>';
+					echo '<tr>';
+						echo '<th class="th th-addrow click-add-onboarding">+ Onboarder</th>';
+						echo '<th class="th th-addrow click-add-software">+ Software</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+						echo '<th class="th th-addrow">&nbsp;</th>';
+					echo '</tr>';
+				echo '</thead>';
+				echo '<tbody>';
+
+		if(sqlsrv_has_rows($oOnboarderResult) > 0)
+		{
+					while($rsOnboarder = sqlsrv_fetch_array($oOnboarderResult, SQLSRV_FETCH_ASSOC))
+					{
+						$iEmployeeId = (int)$rsOnboarder['id_employee'];
+
+						// Récupérer les applications approuvées depuis dbo.Approval (nouveau schéma, dbo.Software supprimée)
+						$sSoftwareList = '';
+						$sSoftwareQuery = "SELECT b.ApplicationName, a.TotalAmount, a.Status "
+										. "FROM dbo.Approval a "
+										. "JOIN dbo.bApplicationPrice b ON b.IdApplication = a.IdApplication "
+										. "WHERE a.id_employee = " . $iEmployeeId . " ORDER BY b.ApplicationName";
+						$oSoftwareResult = sqlsrv_query($oDB->DBHandle(), $sSoftwareQuery);
+						if($oSoftwareResult !== false)
+						{
+							$aSoftwareLines = [];
+							while($rsSoftware = sqlsrv_fetch_array($oSoftwareResult, SQLSRV_FETCH_ASSOC))
+								$aSoftwareLines[] = htmlspecialchars($rsSoftware['ApplicationName']) . ' (' . number_format((float)$rsSoftware['TotalAmount'], 2, '.', '') . ' €) [' . htmlspecialchars($rsSoftware['Status']) . ']';
+							$sSoftwareList = implode('<br>', $aSoftwareLines);
+						}
+
+						echo '<tr class="click-upddel click-context">';
+							echo '<input type="hidden" id="Id" value="' . $iEmployeeId . '">';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['FirstName'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['LastName'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['AccountName'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['Company'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['Initials'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['JobTitle'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['TeamName'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['Manager'] ?? '') . '</td>';
+							echo '<td class="td">' . htmlspecialchars($rsOnboarder['Mail'] ?? '') . '</td>';
+							echo '<td class="td">' . $sSoftwareList . '</td>';
+						echo '</tr>';
+					}
+		}
+		else
+		{
+			echo '<tr><td colspan="10" style="text-align: center;"><div class="noresult">No result found</div></td></tr>';
+		}
+
+				echo '</tbody>';
+			echo '</table>';
+		echo '</div>';
+
+		$oDB->disconnectSqlDB();
+	}
+	else
+	{
+		echo '<div class="noresult">No result found</div>';
+	}
+?>
+<?php
+	/* RESET-ERREUR - Remet le code d'erreur à "succès neutre" après affichage de la liste (évite de répéter le message au prochain chargement) */
+	$_SESSION['ErrorCode'] = 'e10000000';
+?>
+<?php
+	}
+	else
+		require(realpath($_SERVER["DOCUMENT_ROOT"]) . Global_Webui_DEFAULT_ERROR);
+?>

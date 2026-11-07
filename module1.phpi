@@ -1,0 +1,29 @@
+<?php
+/*****************************************************************/
+/*** Auteur   : Emmanuel L.    Date    : 02/04/2026     ***/
+/*** Fichier  : module1.phpi          Version : 1.0.0          ***/
+/*** Titre    : Formulaire onboarding (point d'entrée module)  ***/
+/*****************************************************************/
+/*
+  Wrapper standard du framework : charge init.phpi, vérifie les droits,
+  injecte module1.js et le conteneur #searchlist (rempli en AJAX par
+  module1search.phpi via updateSearch() de /js/edit.js).
+*/
+	require(realpath($_SERVER["DOCUMENT_ROOT"]) . '/app/init.phpi');
+	$_SESSION['Content'] = $_SERVER['PHP_SELF'];
+
+	if(isGrantedAccess($_SERVER['PHP_SELF']))
+	{
+?>
+		<script type="text/javascript" src="<?php echo $fJS; ?>?v=@Function.GUID~"></script>
+
+		<?php $sErrCode = $_SESSION['ErrorCode'] ?? 'e10000000'; $_SESSION['ErrorCode'] = 'e10000000'; ?>
+		<param id="ErrCde" value="<?php echo $sErrCode; ?>">
+		<param id="ErrMsg" value="<?php echo $tErrors[$sErrCode] ?? $sErrCode; ?>">
+
+		<div id="searchlist"></div>
+<?php
+	}
+	else
+		require(realpath($_SERVER["DOCUMENT_ROOT"]) . Global_Webui_DEFAULT_ERROR);
+?>

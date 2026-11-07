@@ -1,0 +1,1110 @@
+﻿<?php
+/*****************************************************************/
+/*** Auteur   : Emmanuel L.    Date    : 02/04/2026     ***/
+/*** Fichier  : module1edit.phpi      Version : 1.0.0          ***/
+/*** Titre    : Formulaire onboarding (contrôleur backend)     ***/
+/*****************************************************************/
+/*
+  Rôle : 2 parties dans ce fichier
+    1. Dispatcher AJAX (POST fct=1..18) - datalists, unicité, prix, cascade
+    2. Rendu HTML des formulaires (act=1 add, act=2 edit, act=3 confirm, act=4 SQL)
+
+  Le guard $bIsAjaxCall skippe le rendu HTML pour les requêtes AJAX.
+  Inspiré de boardingedit.phpi / fctboarding.phpi (Hoeffel N. 2023), fusionnés ici.
+  Dépendances : /app/init.phpi, cSQLServer, isGrantedAccess(), /js/modal.js
+*/
+
+	require(realpath($_SERVER["DOCUMENT_ROOT"]) . '/app/init.phpi');
+
+/* AD group qui recoit les notifications d'approbation IT (etapes 1 et 3) */
+if(!defined('APPROVAL_IT_AD_GROUP')) define('APPROVAL_IT_AD_GROUP', 'G_IT_Approvers');
+/* dbo.Notification.NotifType est un tinyint : 1 = APPROVAL */
+if(!defined('NOTIF_TYPE_APPROVAL')) define('NOTIF_TYPE_APPROVAL', 1);
+/* [TEST] Redirige le manager de toute nouvelle demande logiciel vers cet email pour pouvoir tester le workflow complet sur un seul compte. Mettre '' pour desactiver. */
+if(!defined('APPROVAL_TEST_REDIRECT_MANAGER')) define('APPROVAL_TEST_REDIRECT_MANAGER', '');
+
+/*** Helper [NOTIF] - Marque comme traitees les notifications APPROVAL en attente pour (IdRequest, ApprovalStep). ***/
+if(!function_exists('markApprovalNotificationsActioned'))
+{
+	function markApprovalNotificationsActioned($oDb, $iIdRequest, $iStep)
+	{
+		sqlsrv_query($oDb->DBHandle(),
+			"UPDATE dbo.Notification SET IsActioned = 1 "
+			. "WHERE NotifType = ? AND IsActioned = 0 "
+			. "  AND id_approval IN (SELECT id_approval FROM dbo.Approval WHERE IdRequest = ? AND ApprovalStep = ?)",
+			array(NOTIF_TYPE_APPROVAL, (int)$iIdRequest, (int)$iStep));
+	}
+}
+
+//****************************************************************//
+//*** 1. DISPATCHER AJAX (Auto-complétion et vérifications)    ***//
+//****************************************************************//
+
+	/* AJAX DISPATCHER (POST fct=1..18) - Sortie pure (option/text). Le rendu HTML est skippé via $bIsAjaxCall. */
+	$bIsAjaxCall = (isset($_POST['fct']) && $_POST['fct'] !== '');
+	if($bIsAjaxCall)
+	{
+		/* SECURITY - Meme controle d'autorisation que le rendu HTML, applique aussi aux appels AJAX. */
+		if(!isGrantedAccess($_SERVER['PHP_SELF']))
+			exit;
+
+		$sFunctionCode = $_POST['fct'];
+
+		$oDbConnection = new cSQLServer();
+		$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+		$oDbConnection->connectSqlDB();
+
+		if($oDbConnection->isConnected())
+		{
+			//----------------------------------------------------------------//
+			//  Datalists d'auto-complétion (fct 1 à 11)
+			//----------------------------------------------------------------//
+
+
+			//*** fct=3 : Entreprises (Company) depuis dbo.aADUsers ***
+			if($sFunctionCode == '3')
+			{
+				$sCompaniesQuery = "SELECT DISTINCT Company FROM dbo.aADUsers WHERE Company IN ('Société A', 'Société B', 'Société C', 'Société D', 'Société E', 'Société F', 'Société G', 'Société H', 'Société I', 'Société J', 'Société K', 'Société L', 'Société M', 'Société N') ORDER BY Company";
+				$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sCompaniesQuery);
+
+				while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+					echo '<option class="menu-selvalue" value="' . htmlspecialchars($rsCurrent['Company']) . '">' . htmlspecialchars($rsCurrent['Company']) . '</option>';
+			}
+
+
+			//*** fct=9 : Employés onboardés (datalist du formulaire Software, label="LastName FirstName") ***
+			if($sFunctionCode == '9')
+			{
+				$sOnboardersQuery = "SELECT LastName, FirstName FROM dbo.Onboarder WHERE LastName IS NOT NULL AND LastName != '' ORDER BY LastName, FirstName";
+				$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sOnboardersQuery);
+
+				while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+				{
+					$sLabelText = $rsCurrent['LastName'] . ' ' . $rsCurrent['FirstName'];
+					echo '<option class="menu-selvalue" value="' . htmlspecialchars($sLabelText) . '">' . htmlspecialchars($sLabelText) . '</option>';
+				}
+			}
+
+			//*** fct=10 : Logiciels (ApplicationName) depuis dbo.bApplicationPrice ***
+			if($sFunctionCode == '10')
+			{
+				$sSoftwaresQuery = "SELECT DISTINCT ApplicationName FROM dbo.bApplicationPrice WHERE ApplicationName IS NOT NULL AND ApplicationName != '' ORDER BY ApplicationName";
+				$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sSoftwaresQuery);
+
+				while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+					echo '<option class="menu-selvalue" value="' . htmlspecialchars($rsCurrent['ApplicationName']) . '">' . htmlspecialchars($rsCurrent['ApplicationName']) . '</option>';
+			}
+
+			//*** fct=11 : Prix d'un logiciel depuis dbo.bApplicationPrice ***
+			if($sFunctionCode == '11')
+			{
+				$sApplicationName = str_replace("\0", '', trim($_POST['applicationName'] ?? ''));
+				if($sApplicationName != '')
+				{
+					$sSoftwarePriceQuery = "SELECT TOP 1 Price FROM dbo.bApplicationPrice WHERE ApplicationName = ?";
+					$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sSoftwarePriceQuery, array($sApplicationName));
+
+					if($oQueryResult && $rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+						echo $rsCurrent['Price'];
+				}
+			}
+
+
+			//----------------------------------------------------------------//
+			//  Vérifications de doublons (fct 12 à 15)
+			//----------------------------------------------------------------//
+
+			//*** fct=12 : Vérifie si les initiales existent déjà dans dbo.aADUsers ***
+			if($sFunctionCode == '12')
+			{
+				$sInitialToCheck = str_replace("\0", '', trim($_POST['initial'] ?? ''));
+				$iDuplicateCount = -1;
+				if($sInitialToCheck != '')
+				{
+					$sInitialCheckQuery = "SELECT COUNT(*) AS Cnt FROM dbo.aADUsers WHERE Initial = ?";
+					$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sInitialCheckQuery, array($sInitialToCheck));
+					while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+						$iDuplicateCount = $rsCurrent['Cnt'];
+				}
+				echo $iDuplicateCount;
+			}
+
+			//*** fct=13 : Vérifie si l'email existe déjà dans dbo.aADUsers OU dbo.Onboarder ***
+			if($sFunctionCode == '13')
+			{
+				$sEmailToCheck   = str_replace("\0", '', trim($_POST['email'] ?? ''));
+				$sExcludeIdRaw   = str_replace("\0", '', trim($_POST['excludeId'] ?? ''));
+				$iDuplicateCount = -1;
+				if($sEmailToCheck != '')
+				{
+					/* excludeId = id_employee en cours d'édition (exclu de Onboarder pour ne pas bloquer la mise à jour) */
+					$iEmployeeIdExclude = ($sExcludeIdRaw != '' && $sExcludeIdRaw != '-1') ? (int)$sExcludeIdRaw : -1;
+					if($iEmployeeIdExclude != -1)
+					{
+						$sEmailCheckQuery = "SELECT ("
+							. "(SELECT COUNT(*) FROM dbo.aADUsers WHERE Email = ?)"
+							. " + "
+							. "(SELECT COUNT(*) FROM dbo.Onboarder WHERE Mail = ? AND id_employee != ?)"
+							. ") AS Cnt";
+						$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sEmailCheckQuery, array($sEmailToCheck, $sEmailToCheck, $iEmployeeIdExclude));
+					}
+					else
+					{
+						$sEmailCheckQuery = "SELECT ("
+							. "(SELECT COUNT(*) FROM dbo.aADUsers WHERE Email = ?)"
+							. " + "
+							. "(SELECT COUNT(*) FROM dbo.Onboarder WHERE Mail = ?)"
+							. ") AS Cnt";
+						$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sEmailCheckQuery, array($sEmailToCheck, $sEmailToCheck));
+					}
+					while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+						$iDuplicateCount = $rsCurrent['Cnt'];
+				}
+				echo $iDuplicateCount;
+			}
+
+			//*** fct=15 : Verifie l'existence d'un onboarder dans dbo.aADUsers ET dbo.Onboarder ***
+			//*** RETOUR : "accountname=N&fullname=M" ; N>0 si AccountName existe, M>0 si LastName+FirstName existe ***
+			if($sFunctionCode == '15')
+			{
+				$sLastNameToCheck    = str_replace("\0", '', trim($_POST['lastName']    ?? ''));
+				$sFirstNameToCheck   = str_replace("\0", '', trim($_POST['firstName']   ?? ''));
+				$sAccountNameToCheck = str_replace("\0", '', trim($_POST['accountName'] ?? ''));
+				$iEmployeeIdExclude  = (int)(str_replace("\0", '', trim($_POST['excludeId'] ?? '0')));
+
+				$iAccountNameExists = 0;
+				$iFullNameExists    = 0;
+
+				/* AccountName : verification dans aADUsers ET dans Onboarder (hors ID en cours d'edition) */
+				if($sAccountNameToCheck != '')
+				{
+					$sAccountNameCheckQuery = "SELECT ("
+							. "(SELECT COUNT(*) FROM dbo.aADUsers WHERE AccountName = ?)"
+							. " + "
+							. "(SELECT COUNT(*) FROM dbo.Onboarder WHERE AccountName = ? AND id_employee != ?)"
+							. ") AS Cnt";
+					$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sAccountNameCheckQuery, array($sAccountNameToCheck, $sAccountNameToCheck, $iEmployeeIdExclude));
+					if($oQueryResult && ($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC)))
+						$iAccountNameExists = (int)$rsCurrent['Cnt'];
+				}
+
+				/* LastName + FirstName : verification dans aADUsers ET dans Onboarder (hors ID en cours d'edition) */
+				if($sLastNameToCheck != '' && $sFirstNameToCheck != '')
+				{
+					$sFullNameCheckQuery = "SELECT ("
+							. "(SELECT COUNT(*) FROM dbo.aADUsers WHERE Lastname = ? AND Firstname = ?)"
+							. " + "
+							. "(SELECT COUNT(*) FROM dbo.Onboarder WHERE LastName = ? AND FirstName = ? AND id_employee != ?)"
+							. ") AS Cnt";
+					$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sFullNameCheckQuery, array($sLastNameToCheck, $sFirstNameToCheck, $sLastNameToCheck, $sFirstNameToCheck, $iEmployeeIdExclude));
+					if($oQueryResult && ($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC)))
+						$iFullNameExists = (int)$rsCurrent['Cnt'];
+				}
+
+				echo 'accountname=' . $iAccountNameExists . '&fullname=' . $iFullNameExists;
+			}
+
+
+			//*** fct=14 : Résout le nom saisi en id_employee (formulaire Software) ***
+			if($sFunctionCode == '14')
+			{
+				$sSearchFullName     = str_replace("\0", '', trim($_POST['fullName'] ?? ''));
+				$iResolvedEmployeeId = '';
+				$sHomonymPipeList    = '';
+				if($sSearchFullName != '')
+				{
+					// Nettoyage de l'entrée utilisateur : suppression des espaces superflus (ex: doubles espaces)
+					$sSearchNormalized = preg_replace('/\s+/', ' ', trim($sSearchFullName));
+
+					// Recherche de l'employé dans Onboarder par "Nom Prénom" OU "Prénom Nom"
+					$sEmployeeSearchQuery = "SELECT o.id_employee, o.FirstName, o.LastName, o.Team AS TeamName "
+							. "FROM dbo.Onboarder o "
+							. "WHERE LTRIM(RTRIM(o.LastName)) + ' ' + LTRIM(RTRIM(o.FirstName)) = ? "
+							. "   OR LTRIM(RTRIM(o.FirstName)) + ' ' + LTRIM(RTRIM(o.LastName)) = ? "
+							. "ORDER BY o.LastName, o.FirstName";
+					$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sEmployeeSearchQuery, array($sSearchNormalized, $sSearchNormalized));
+
+					$aUserMatches = [];
+					if($oQueryResult !== false)
+					{
+						// Stockage de tous les résultats correspondants dans un tableau
+						while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+						{
+							$aUserMatches[] = [
+								'id'    => $rsCurrent['id_employee'],
+								'label' => $rsCurrent['LastName'] . ' ' . $rsCurrent['FirstName'] . ' (' . ($rsCurrent['TeamName'] ?? '') . ')'
+							];
+						}
+
+						if(count($aUserMatches) == 1)
+							$iResolvedEmployeeId = $aUserMatches[0]['id'];
+						elseif(count($aUserMatches) > 1)
+						{
+							/* Sanitize label : retire les caractères de contrôle du format (':' et '|') qui casseraient le parsing JS */
+							$aHomonymPairs = [];
+							foreach($aUserMatches as $aUserMatch)
+							{
+								$sCleanLabel = str_replace(array('|', ':', ';'), ' ', $aUserMatch['label']);
+								$aHomonymPairs[] = (int)$aUserMatch['id'] . ':' . htmlspecialchars($sCleanLabel, ENT_QUOTES, 'UTF-8');
+							}
+							$sHomonymPipeList = implode('|', $aHomonymPairs);
+						}
+
+						// Envoi de la réponse formattée à Javascript (ex: userid=123;matches=123:Label|456:Label)
+						echo 'userid=' . ((int)$iResolvedEmployeeId > 0 ? (int)$iResolvedEmployeeId : '') . ';';  // vide (pas 0) si non resolu -> JS affiche les homonymes
+						if($sHomonymPipeList != '') echo 'matches=' . $sHomonymPipeList . ';';
+					}
+				}
+			}
+
+
+		//----------------------------------------------------------------//
+		//  Cascade Company → Team → Manager (fct 16 à 19)
+		//----------------------------------------------------------------//
+
+		/*** Helper [MODULE] - Resout le domaine email (ex: 'exemple.lu') a partir du nom Company.
+		     Necessaire car les stored procs framework p_BoardingUsersOn* attendent un domaine,
+		     pas un nom de societe. Prend le 1er email actif d'un utilisateur de la societe. ***/
+		if(!function_exists('resolveCompanyDomain'))
+		{
+			function resolveCompanyDomain($oDbConnection, $sCompany)
+			{
+				$sCompanyDomainQuery = "SELECT TOP 1 SUBSTRING(Email, CHARINDEX('@', Email) + 1, 100) AS Domain"
+					. " FROM dbo.aADUsers"
+					. " WHERE Company = ?"
+					. " AND Email LIKE '%@%' AND IsEnabled = 1"
+					. " AND Email NOT LIKE '%extern%'"
+					. " ORDER BY Email";
+				$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sCompanyDomainQuery, array($sCompany));
+				if($oQueryResult !== false && ($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC)))
+					return $rsCurrent['Domain'];
+				return '';
+			}
+		}
+
+		//*** fct=16 : Equipes (Department) filtrees par Company depuis dbo.aADUsers ***
+		if($sFunctionCode == '16')
+		{
+			$sFilterCompany = str_replace("\0", '', trim($_POST['company'] ?? ''));
+			if($sFilterCompany != '')
+			{
+				$sDepartmentsByCompanyQuery = "SELECT DISTINCT Department FROM dbo.aADUsers"
+						. " WHERE Company = ?"
+						. " AND Department IS NOT NULL AND Department != ''"
+						. " AND IsEnabled = 1"
+						. " ORDER BY Department";
+				$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sDepartmentsByCompanyQuery, array($sFilterCompany));
+
+				while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+					echo '<option class="menu-selvalue" value="' . htmlspecialchars($rsCurrent['Department']) . '">' . htmlspecialchars($rsCurrent['Department']) . '</option>';
+			}
+		}
+
+		//*** fct=17 : Job Titles filtres par Company et Team depuis dbo.aADUsers ***
+		if($sFunctionCode == '17')
+		{
+			$sFilterCompany    = str_replace("\0", '', trim($_POST['company'] ?? ''));
+			$sFilterDepartment = str_replace("\0", '', trim($_POST['team']    ?? ''));
+			if($sFilterCompany != '' && $sFilterDepartment != '')
+			{
+				$sTitlesByTeamQuery = "SELECT DISTINCT Title FROM dbo.aADUsers"
+						. " WHERE Company = ?"
+						. " AND Department = ?"
+						. " AND Title IS NOT NULL AND Title != ''"
+						. " AND IsEnabled = 1"
+						. " ORDER BY Title";
+				$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sTitlesByTeamQuery, array($sFilterCompany, $sFilterDepartment));
+
+				while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+					echo '<option class="menu-selvalue" value="' . htmlspecialchars($rsCurrent['Title']) . '">' . htmlspecialchars($rsCurrent['Title']) . '</option>';
+			}
+		}
+
+		//*** fct=18 : Managers d'une Team dans une Company depuis dbo.aADUsers (sortie pipe-separated pour resolveManager JS) ***
+		if($sFunctionCode == '18')
+		{
+			$sFilterCompany    = str_replace("\0", '', trim($_POST['company'] ?? ''));
+			$sFilterDepartment = str_replace("\0", '', trim($_POST['team']    ?? ''));
+			if($sFilterCompany != '' && $sFilterDepartment != '')
+			{
+			$sManagersByTeamQuery = "SELECT DISTINCT m.Email"
+					. " FROM dbo.aADUsers u"
+					. " INNER JOIN dbo.aADUsers m ON m.IdUser = u.IdMgmtUser"
+					. " WHERE u.Company = ?"
+					. " AND u.Department = ?"
+					. " AND u.IsEnabled = 1 AND m.IsEnabled = 1"
+					. " AND m.Email IS NOT NULL AND m.Email != ''";
+			$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sManagersByTeamQuery, array($sFilterCompany, $sFilterDepartment));
+
+			$aManagerEmails = array();
+			if($oQueryResult !== false)
+				while($rsCurrent = sqlsrv_fetch_array($oQueryResult, SQLSRV_FETCH_ASSOC))
+					if(!empty($rsCurrent['Email']))
+						$aManagerEmails[] = $rsCurrent['Email'];
+
+			$aManagerEmails = array_values(array_unique($aManagerEmails));
+			echo implode('|', $aManagerEmails);
+			} /* fin if company+team non vides */
+		}
+
+		//*** fct=19 : Domaine email d'une société depuis dbo.aADUsers (extrait du 1er email actif de la société) ***
+		if($sFunctionCode == '19')
+		{
+			$sFilterCompany = str_replace("\0", '', trim($_POST['company'] ?? ''));
+			$sDomain = '';
+			if($sFilterCompany != '')
+				$sDomain = resolveCompanyDomain($oDbConnection, $sFilterCompany);
+			echo $sDomain;
+		}
+
+			$oDbConnection->disconnectSqlDB();
+		}
+	}
+?>
+
+<?php if(!$bIsAjaxCall) { ?>
+<!-- JS-MODAL - Charge modal.js : gère le flux btnAdd→act=4, btnUpdate→act=3→act=4, btnDelete→act=3→act=4 -->
+<script type="text/javascript" src="/js/modal.js?v=@Function.GUID~"></script>
+<?php } ?>
+
+<?php
+	/* SECURITY - Vérifie les droits d'accès (uniquement pour le rendu HTML, pas pour les requêtes AJAX) */
+	if(!$bIsAjaxCall)
+	{
+	if(isGrantedAccess($_SERVER['PHP_SELF']))
+	{
+		/*** GET-PARAMS - Récupère les paramètres passés par modal.js via l'URL ***/
+
+		/* ACT - Numéro d'action : 1=add form, 2=edit form, 3=confirm, 4=execute */
+		if(isset($_GET['act']))
+			$iFormAct = $_GET['act'];
+		else
+			$iFormAct = -1;
+
+		/* ACTION - Type d'opération : 'add', 'update' ou 'delete' (défini par modal.js) */
+		if(isset($_GET['action']))
+			$sFormAction = $_GET['action'];
+		else
+			$sFormAction = '';
+
+		/*** FORM-VALUES - Récupère l'ID de l'enregistrement et le type de formulaire ***/
+
+		/* ID - Identifiant de l'enregistrement (à éditer ou supprimer) */
+		if(isset($_GET['id']))
+			if($_GET['id'] != 'undefined')
+				$iEmployeeId = $_GET['id'];
+			else
+				$iEmployeeId = -1;
+		else
+			$iEmployeeId = -1;
+
+		/* FORM-TYPE - 'onboarding' ou 'software' : détermine quel formulaire afficher */
+		if(isset($_GET['form']))
+			$sFormType = $_GET['form'];
+		else
+			$sFormType = 'onboarding';
+
+//****************************************************************//
+//*** 2. FORMULAIRE : AJOUTER UN EMPLOYÉ (act=1, onboarding)   ***//
+//****************************************************************//
+
+		/*** ADD-ONBOARDING (act=1) - Formulaire d'ajout d'un employé ***/
+		/* TRIGGER : clic sur bouton "Onboarder" (click-add dans module1search.phpi) */
+		/* FLOW : act=1 → validate() → btnAdd → modal.js envoie act=4&action=add */
+		if($iFormAct == 1 && $sFormType == 'onboarding')
+		{
+			echo '<div class="modal-header">';
+				echo '<div class="modal-title fs-5">Add an employee</div>';
+				echo '<div class="btn-modal-close" aria-label="Close">X</div>';
+			echo '</div>';
+
+			echo '<div class="modal-body">';
+				echo '<div class="msgalert-text modal-alert alert" role="alert">&nbsp;</div>';
+
+				echo '<form class="frm-modal" id="frmEdit" autocomplete="off">'; /* FORM - requis par modal.js pour lire les champs ; autocomplete off → désactive l'autofill du navigateur */
+					/* HIDDEN-FIELDS - Champs cachés utilisés par modal.js pour le routage */
+					echo '<input hidden="hidden" type="text" id="act" name="act" value="' . $iFormAct . '">';
+					echo '<input hidden="hidden" type="text" id="action" name="action">';       /* ACTION - Rempli par modal.js (add/update/delete) */
+					echo '<input hidden="hidden" type="text" id="form" name="form" value="onboarding">'; /* FORM-TYPE - Identifie le formulaire pour validate()/buildParam() */
+
+					echo '<div class="frm-fields">';
+						echo '<div>Last Name</div>';
+						echo '<input type="text" id="LastName" name="LastName" autocomplete="off">';
+
+						echo '<div>First Name</div>';
+						echo '<input type="text" id="FirstName" name="FirstName" autocomplete="off">';
+
+						echo '<div>Initials</div>';
+						echo '<input type="text" id="Initials" name="Initials" maxlength="3" autocomplete="off">';
+
+						echo '<div>Account Name</div>';
+						echo '<input type="text" id="AccountName" name="AccountName" autocomplete="off">';
+
+						echo '<div>Company</div>';
+						echo '<input type="text" id="Company" name="Company" list="companiesList" autocomplete="off">';
+						echo '<datalist id="companiesList"></datalist>';
+
+						echo '<div id="d_team" style="display:none; font-weight:normal; padding:0;">';
+							echo '<div>Team</div>';
+							echo '<input type="text" id="Team" name="Team" list="teamsList" autocomplete="off">';
+							echo '<datalist id="teamsList"></datalist>';
+						echo '</div>';
+
+						echo '<div id="d_manager" style="display:none; font-weight:normal; padding:0;">';
+							echo '<div>Manager</div>';
+							echo '<input type="text" id="Manager" name="Manager" list="managersList" autocomplete="off">';
+							echo '<datalist id="managersList"></datalist>';
+						echo '</div>';
+
+						echo '<div id="d_jobtitle" style="display:none; font-weight:normal; padding:0;">';
+							echo '<div>Job Title</div>';
+							echo '<input type="text" id="JobTitle" name="JobTitle" list="jobTitlesList" autocomplete="off">';
+							echo '<datalist id="jobTitlesList"></datalist>';
+						echo '</div>';
+
+						echo '<div>Mail</div>';
+						echo '<input type="text" id="Mail" name="Mail" autocomplete="off">';
+
+						echo '<div>Start Date</div>';
+						echo '<input type="date" id="StartDate" name="StartDate" value="' . date('Y-m-d') . '">';
+
+						echo '<div>End Date <span style="font-size:0.8em;font-weight:normal;color:#888;">(optional)</span></div>';
+						echo '<input type="date" id="EndDate" name="EndDate">';
+
+					echo '</div>';
+
+					/* SUBMIT - Bouton Add : déclenche validate() puis buildParam() puis act=4 via modal.js */
+					echo '<div class="btn-group"><input type="button" class="btn-classic btn btn-primary btn-lg btn-modal" id="btnAdd" name="Add" value="Add"></div>';
+				echo '</form>';
+			echo '</div>';
+
+			/* AUTOCOMPLETE - Datalists chargées automatiquement par initModalAutoload() dans module1.js */
+		}
+
+//****************************************************************//
+//*** 3. FORMULAIRE : AJOUTER UN LOGICIEL (act=1, software)    ***//
+//****************************************************************//
+
+		/*** ADD-SOFTWARE (act=1) - Formulaire d'ajout d'un logiciel pour un employé ***/
+		/* TRIGGER : clic sur bouton "Software" (onclick dans module1search.phpi) */
+		/* DB-CONNECTION : nécessaire pour le dropdown Software (User est désormais en datalist AJAX) */
+		if($iFormAct == 1 && $sFormType == 'software')
+		{
+			/* DB - Connexion SQL Server pour le dropdown Software */
+			$oDbConnection = new cSQLServer();
+			$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+			$oDbConnection->connectSqlDB();
+
+			echo '<div class="modal-header">';
+				echo '<div class="modal-title fs-5">Add a software</div>';
+				echo '<div class="btn-modal-close" aria-label="Close">X</div>';
+			echo '</div>';
+
+			echo '<div class="modal-body">';
+				echo '<div class="msgalert-text modal-alert alert" role="alert">&nbsp;</div>';
+
+				echo '<form class="frm-modal" id="frmEdit">';
+					echo '<input hidden="hidden" type="text" id="act" name="act" value="' . $iFormAct . '">';
+					echo '<input hidden="hidden" type="text" id="action" name="action">';
+					echo '<input hidden="hidden" type="text" id="form" name="form" value="software">';
+
+					echo '<div class="frm-fields">';
+						/* FIELD - User : auto-complétion via <datalist> AJAX (get_users) */
+						/* FORMAT-OPTION : "LastName FirstName" - l'IdEmployee est résolu en JS (resolveUser) et stocké dans #UserId */
+						echo '<div>User</div>';
+						echo '<input type="text" id="User" name="User" list="usersList">';
+						echo '<datalist id="usersList"></datalist>'; /* AUTOCOMPLETE - rempli par loadUsersList() */
+						echo '<input hidden="hidden" type="text" id="UserId" name="UserId" value="">'; /* HIDDEN-FK - vrai IdEmployee résolu côté serveur */
+						echo '<span class="msg-success"></span>'; /* STATUS-INDICATOR - message de résolution ou demande de désambiguïsation */
+						echo '<div id="UserDisambig" style="display:none;"></div>'; /* DISAMBIG - liste de choix si plusieurs homonymes */
+
+						/* MULTI-SOFTWARE - Liste dynamique de logiciels avec coût associé */
+						/* PATTERN : addSoftwareRow() / removeSoftwareRow() ajoutent/retirent des <div class="input-group"> dans #softwareRows */
+						/* DATALIST partagé : tous les inputs Software pointent sur #softwareList rempli par loadSoftwaresList() */
+						echo '<div>Software / Cost</div>';
+						echo '<div id="softwareRows">';
+							/* TEMPLATE-ROW - première ligne par défaut (non supprimable si seule ligne) */
+							echo '<div class="input-group">';
+								echo '<input type="text" class="form-control software-input" name="Software[]" list="softwareList" placeholder="Software">';
+								echo '<input type="text" class="form-control cost-input" name="Cost[]" placeholder="Cost (€)">';
+								echo '<button type="button" class="btn btn-danger btn-remove-software">X</button>';
+							echo '</div>';
+						echo '</div>';
+						echo '<datalist id="softwareList"></datalist>'; /* AUTOCOMPLETE - rempli par loadSoftwaresList() */
+						echo '<div><button type="button" class="btn-addmore btn-classic btn-add-software">+</button></div>';
+					echo '</div>';
+
+					echo '<div class="btn-group"><input type="button" class="btn-classic btn btn-primary btn-lg btn-modal" id="btnAdd" name="Add" value="Add"></div>';
+				echo '</form>';
+			echo '</div>';
+
+			/* AUTOCOMPLETE - Datalists Users/Software chargées automatiquement par initModalAutoload() dans module1.js */
+
+			/* DB-DISCONNECT - Ferme la connexion après le rendu du formulaire */
+			if($oDbConnection->isConnected())
+				$oDbConnection->disconnectSqlDB();
+		}
+
+//****************************************************************//
+//*** 3b. FORMULAIRE : APPROBATION LOGICIELS (act=1, approval) ***//
+//*** Supprimé : chemin remplacé par app/sys/tasks/tasksinfo.phpi (renderPendingApprovalBlock) ***//
+//****************************************************************//
+
+		/* APPROVAL-FORM (act=1) - désactivé : l'approbation se fait via le badge Tasks (tasksinfo.phpi).
+		   L'exécution (act=4, form=approval) reste active ci-dessous. */
+//****************************************************************//
+//*** 4. FORMULAIRE : MODIFICATION EMPLOYÉ (act=2)             ***//
+//****************************************************************//
+
+		/*** EDIT-ONBOARDING (act=2) - Formulaire de modification/suppression d'un employé ***/
+		/* TRIGGER : double-clic sur une ligne du tableau (click-upddel dans edit.js) */
+		/* FLOW : act=2 → validate() → btnUpdate/btnDelete → act=3 (confirm) → act=4 (execute) */
+		if($iFormAct == 2 && $iEmployeeId != -1 && $sFormType == 'onboarding')
+		{
+			/* DB - Chargement des données de l'employé depuis la base par $iEmployeeId */
+			$sLastName = ''; $sFirstName = ''; $sCompany = ''; $sInitials = ''; $sJobTitle = ''; $sTeamName = ''; $sManagerName = ''; $sEmail = '';
+
+			$oDbConnection = new cSQLServer();
+			$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+			$oDbConnection->connectSqlDB();
+
+			if($oDbConnection->isConnected())
+			{
+				/*** EDIT-LOAD - Lecture directe de dbo.Onboarder par id_employee (table autonome) ***/
+				$sLoadOnboarderQuery = "SELECT o.LastName, o.FirstName, o.AccountName, o.Company, o.Initials, o.JobTitle, "
+						. "       o.Team AS TeamName, o.Manager, o.Mail "
+						. "FROM dbo.Onboarder o "
+						. "WHERE o.id_employee = " . (int)$iEmployeeId;
+				$oOnboarderResult = sqlsrv_query($oDbConnection->DBHandle(), $sLoadOnboarderQuery);
+
+				if($oOnboarderResult && ($rsOnboarder = sqlsrv_fetch_array($oOnboarderResult, SQLSRV_FETCH_ASSOC)))
+				{
+					$sLastName    = $rsOnboarder['LastName']    ?? '';
+					$sFirstName   = $rsOnboarder['FirstName']   ?? '';
+					$sAccountName = $rsOnboarder['AccountName'] ?? '';
+					$sCompany     = $rsOnboarder['Company']     ?? '';
+					$sInitials    = $rsOnboarder['Initials']    ?? '';
+					$sJobTitle    = $rsOnboarder['JobTitle']    ?? '';
+					$sTeamName    = $rsOnboarder['TeamName']    ?? '';
+					$sManagerName = $rsOnboarder['Manager']     ?? '';
+					$sEmail       = $rsOnboarder['Mail']        ?? '';
+				}
+				$oDbConnection->disconnectSqlDB();
+			}
+
+			echo '<div class="modal-header">';
+				echo '<div class="modal-title fs-5">Editing : ' . htmlspecialchars($sLastName) . ' ' . htmlspecialchars($sFirstName) . '</div>';
+				echo '<div class="btn-modal-close" aria-label="Close">X</div>';
+			echo '</div>';
+
+			echo '<div class="modal-body">';
+				echo '<div class="msgalert-text modal-alert alert" role="alert">&nbsp;</div>';
+
+				echo '<form class="frm-modal" id="frmEdit" autocomplete="off">';
+					echo '<input hidden="hidden" type="text" id="act" name="act" value="' . $iFormAct . '">';
+					echo '<input hidden="hidden" type="text" id="action" name="action">';
+					echo '<input hidden="hidden" type="text" id="Id" name="Id" value="' . $iEmployeeId . '">';
+					echo '<input hidden="hidden" type="text" id="form" name="form" value="onboarding">';
+
+					echo '<div class="frm-fields">';
+						echo '<div>Last Name</div>';
+						echo '<input type="text" id="LastName" name="LastName" autocomplete="off" readonly value="' . htmlspecialchars($sLastName) . '">';
+
+						echo '<div>First Name</div>';
+						echo '<input type="text" id="FirstName" name="FirstName" autocomplete="off" readonly value="' . htmlspecialchars($sFirstName) . '">';
+
+						echo '<div>Initials</div>';
+						echo '<input type="text" id="Initials" name="Initials" autocomplete="off" value="' . htmlspecialchars($sInitials) . '">';
+
+						echo '<div>Account Name</div>';
+						echo '<input type="text" id="AccountName" name="AccountName" autocomplete="off" value="' . htmlspecialchars($sAccountName) . '">';
+
+						echo '<div>Company</div>';
+						echo '<input type="text" id="Company" name="Company" list="companiesList" autocomplete="off" value="' . htmlspecialchars($sCompany) . '">';
+						echo '<datalist id="companiesList"></datalist>';
+
+						echo '<div>Team</div>';
+						echo '<input type="text" id="Team" name="Team" list="teamsList" autocomplete="off" value="' . htmlspecialchars($sTeamName) . '">';
+						echo '<datalist id="teamsList"></datalist>';
+
+						echo '<div>Manager</div>';
+						echo '<input type="text" id="Manager" name="Manager" list="managersList" autocomplete="off" value="' . htmlspecialchars($sManagerName) . '">';
+						echo '<datalist id="managersList"></datalist>';
+
+						echo '<div>Job Title</div>';
+						echo '<input type="text" id="JobTitle" name="JobTitle" list="jobTitlesList" autocomplete="off" value="' . htmlspecialchars($sJobTitle) . '">';
+						echo '<datalist id="jobTitlesList"></datalist>';
+
+						echo '<div>Mail</div>';
+						echo '<input type="text" id="Mail" name="Mail" autocomplete="off" value="' . htmlspecialchars($sEmail) . '">';
+					echo '</div>';
+
+					/* SUBMIT - Bouton Update uniquement (Delete supprimé) */
+					echo '<div class="btn-group"><input type="button" class="btn btn-primary btn-classic btn-lg btn-modal" id="btnUpdate" name="Update" value="Update"></div>';
+				echo '</form>';
+			echo '</div>';
+
+			/* AUTOCOMPLETE - Datalists chargées automatiquement par initModalAutoload() dans module1.js */
+		}
+
+//****************************************************************//
+//*** 5. MODALE : CONFIRMATION UPDATE / DELETE (act=3)         ***//
+//****************************************************************//
+
+		/*** CONFIRM (act=3) - Dialogue de confirmation avant update ou delete ***/
+		/* FRAMEWORK : modal.js redirige ici après btnUpdate ou btnDelete */
+		/* FLOW : btnConfYes → act=4 (execute) | btnConfNo → act=2 (retour au formulaire) */
+		if($iFormAct == 3 && ($sFormAction == 'update' || $sFormAction == 'delete'))
+		{
+			echo '<div class="modal-header">';
+				echo '<div class="modal-title fs-5">Confirm</div>';
+				echo '<div class="btn-modal-close" aria-label="Close">X</div>';
+			echo '</div>';
+
+			echo '<div class="modal-body">';
+				echo '<div class="msgalert-text modal-alert alert" role="alert">&nbsp;</div>';
+
+				echo '<form class="frm-modal" id="frmEdit">';
+					echo '<input hidden="hidden" type="text" id="act" name="act" value="' . $iFormAct . '">';
+					echo '<input hidden="hidden" type="text" id="action" name="action" value="' . $sFormAction . '">';
+					echo '<input hidden="hidden" type="text" id="Id" name="Id" value="' . $iEmployeeId . '">';
+					echo '<input hidden="hidden" type="text" id="form" name="form" value="' . $sFormType . '">';
+
+					echo '<div class="frm-fields">';
+						echo '<div>Do you really want to ' . $sFormAction . ' ?</div>';
+					echo '</div>';
+
+					echo '<div class="btn-group"><input type="button" class="btn btn-success btn-lg btn-modal" id="btnConfYes" name="Yes" value="Yes"></div>';
+					echo '<div class="btn-group"><input type="button" class="btn btn-danger btn-lg btn-modal" id="btnConfNo" name="No" value="No"></div>';
+				echo '</form>';
+			echo '</div>';
+		}
+
+//****************************************************************//
+//*** 6. EXÉCUTION EN BASE DE DONNÉES (act=4)                  ***//
+//****************************************************************//
+
+		/*** EXECUTE (act=4) - Exécute l'action en base de données ***/
+		/* FRAMEWORK : modal.js appelle cette section après confirmation (act=3 → btnConfYes) ou après btnAdd */
+		/* TRACEABILITY : passer $_SESSION['AccountName'] pour identifier l'utilisateur dans l'audit log */
+		if($iFormAct == 4)
+		{
+			/* PARAMS - Récupère les paramètres du formulaire */
+			$sLastName    = $_GET['lastname']    ?? '';
+			$sFirstName   = $_GET['firstname']   ?? '';
+			$sAccountName = $_GET['accountname'] ?? '';
+			$sCompany     = $_GET['company']     ?? '';
+			$sInitials    = $_GET['initials']    ?? '';
+			$sJobTitle    = $_GET['jobtitle']    ?? '';
+			$sTeamName    = $_GET['team']        ?? '';
+			$sManagerName = $_GET['manager']     ?? '';
+			$sEmail       = $_GET['mail']        ?? '';
+			$sStartDate   = $_GET['startdate']   ?? '';
+			$sEndDate     = $_GET['enddate']     ?? '';
+
+			/* Sanitize - suppression des octets nuls et espaces parasites sur tous les champs du formulaire */
+			foreach(array(&$sLastName, &$sFirstName, &$sAccountName, &$sCompany, &$sInitials, &$sJobTitle, &$sTeamName, &$sManagerName, &$sEmail, &$sStartDate, &$sEndDate) as &$sVal)
+				$sVal = str_replace("\0", '', trim($sVal));
+			unset($sVal);
+
+			/*** ADD-ONBOARDING - Insère un nouvel onboarder dans dbo.Onboarder (table autonome, indépendante de aADUsers) ***/
+			/* SCHEMA : Onboarder.id_employee est IDENTITY (auto) ; dbo.Team supprimée, Team est une colonne texte */
+			if($sFormAction == 'add' && $sFormType == 'onboarding')
+			{
+				$oDbConnection = new cSQLServer();
+				$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+				$oDbConnection->connectSqlDB();
+
+				if($oDbConnection->isConnected())
+				{
+										/* SANITIZE - rejette les valeurs parasites ('', 'undefined') et collapse les espaces */
+					$sTeamName = preg_replace('/\s+/', ' ', trim($sTeamName));
+					if(strtolower($sTeamName) === 'undefined') $sTeamName = '';
+
+					/* GUARD - Bloque l'insertion si l'Account Name existe déjà dans dbo.aADUsers ou dbo.Onboarder */
+					/* Note : le doublon de nom (homonyme) est géré côté front-end ; seul l'Account Name doit être unique */
+					$sGuardQuery = "SELECT ("
+					             . "(SELECT COUNT(*) FROM dbo.aADUsers WHERE AccountName = ?)"
+					             . " + "
+					             . "(SELECT COUNT(*) FROM dbo.Onboarder WHERE AccountName = ?)"
+					             . ") AS Cnt";
+					$oGuardResult = sqlsrv_query($oDbConnection->DBHandle(), $sGuardQuery, array($sAccountName, $sAccountName));
+					$iDuplicateCount = 0;
+					if($oGuardResult && ($rsGuard = sqlsrv_fetch_array($oGuardResult, SQLSRV_FETCH_ASSOC)))
+						$iDuplicateCount = (int)$rsGuard['Cnt'];
+
+					/* Guard duplicate Mail in Onboarder */
+					$iMailDuplicateCount = 0;
+					if($sEmail !== '')
+					{
+						$oMailGuardResult = sqlsrv_query($oDbConnection->DBHandle(),
+							"SELECT COUNT(*) AS Cnt FROM dbo.Onboarder WHERE Mail = ?",
+							array($sEmail));
+						if($oMailGuardResult && ($rsMailGuard = sqlsrv_fetch_array($oMailGuardResult, SQLSRV_FETCH_ASSOC)))
+							$iMailDuplicateCount = (int)$rsMailGuard['Cnt'];
+					}
+
+					if($sLastName === '' || $sFirstName === '')
+					{
+						$_SESSION['ErrorCode'] = 'LastName and FirstName are required fields.';
+					}
+					elseif($iDuplicateCount > 0)
+					{
+						$_SESSION['ErrorCode'] = 'This account name already exists in Active Directory or Onboarder and cannot be registered.';
+					}
+					elseif($iMailDuplicateCount > 0)
+					{
+						$_SESSION['ErrorCode'] = 'This email address is already used by another employee and cannot be registered.';
+					}
+					else
+					{
+						/* SQL - Insertion dans dbo.Onboarder (id_employee généré par IDENTITY, on ne le fournit pas) */
+						/* StartDate : défaut aujourd'hui si vide. EndDate : NULL si vide (champ optionnel). */
+						$sStartDateVal = ($sStartDate !== '') ? $sStartDate : date('Y-m-d');
+						$sEndDateVal   = ($sEndDate   !== '') ? $sEndDate   : null;
+
+						$sInsertOnboarderQuery = "INSERT INTO dbo.Onboarder (LastName, FirstName, AccountName, Company, Initials, JobTitle, Team, Manager, Mail, StartDate, EndDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+						$aInsertParams = array($sLastName, $sFirstName, $sAccountName, $sCompany, $sInitials, $sJobTitle, $sTeamName, $sManagerName, $sEmail, $sStartDateVal, $sEndDateVal);
+						$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sInsertOnboarderQuery, $aInsertParams);
+
+						if($oQueryResult !== false)
+						{
+							$_SESSION['ErrorCode'] = 'User successfully created'; /* Success Add Onboarding */
+						}
+						else
+						{
+							$aSqlErrors = sqlsrv_errors();
+							$sSqlErrorMessages = '';
+							if($aSqlErrors) foreach($aSqlErrors as $aSqlError) $sSqlErrorMessages .= $aSqlError['message'] . ' ';
+							$_SESSION['ErrorCode'] = 'Error: ' . $sSqlErrorMessages;
+						}
+					}
+
+					/* FRAMEWORK - Sortie des codes pour l'affichage dans la modale */
+					echo '<input hidden="hidden" type="text" id="ErrCde" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+					echo '<input hidden="hidden" type="text" id="ErrMsg" value="' . htmlspecialchars($tErrors[$_SESSION['ErrorCode']] ?? $_SESSION['ErrorCode']) . '">';
+
+					$oDbConnection->disconnectSqlDB();
+				}
+				else $_SESSION['ErrorCode'] = 'e10004510 - Connection failed';
+			}
+
+			/*** ADD-SOFTWARE - Crée un SoftwareRequest via p_SoftwareRequestCreate et notifie le groupe IT ***/
+			/* PARAMS - softwares=soft1|soft2&userid=<IdEmployee> (résolu côté JS via resolveUser) */
+			if($sFormAction == 'add' && $sFormType == 'software')
+			{
+				$iEmployeeId      = (int)($_GET['userid']    ?? 0);
+				$sSoftwareListRaw = $_GET['softwares']       ?? '';
+
+				if($iEmployeeId > 0 && $sSoftwareListRaw != '')
+				{
+					$aSoftwareNames = explode('|', $sSoftwareListRaw);
+
+					$oDbConnection = new cSQLServer();
+					$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+					$oDbConnection->connectSqlDB();
+
+					if($oDbConnection->isConnected())
+					{
+						/* Récupère AccountName et Manager de l'employé */
+						$sIdRequester = '';
+						$sIdManager   = '';
+						$oOnboarderResult = sqlsrv_query($oDbConnection->DBHandle(),
+							"SELECT AccountName, Manager FROM dbo.Onboarder WHERE id_employee=" . $iEmployeeId);
+						if($oOnboarderResult && $rsOnboarder = sqlsrv_fetch_array($oOnboarderResult, SQLSRV_FETCH_ASSOC))
+						{
+							$sIdRequester = $rsOnboarder['AccountName'] ?? '';
+							$sIdManager   = $rsOnboarder['Manager']     ?? '';
+						}
+						/* [TEST] Override manager pour tests workflow */
+						if(APPROVAL_TEST_REDIRECT_MANAGER !== '') $sIdManager = APPROVAL_TEST_REDIRECT_MANAGER;
+
+						/* Résout les IdApplication a partir des noms de logiciel */
+						$aAppIds = array();
+						foreach($aSoftwareNames as $sSoftware)
+						{
+							$oAppResult = sqlsrv_query($oDbConnection->DBHandle(),
+								"SELECT TOP 1 IdApplication FROM dbo.bApplicationPrice WHERE ApplicationName = ?",
+								array($sSoftware));
+							if($oAppResult && $rsApp = sqlsrv_fetch_array($oAppResult, SQLSRV_FETCH_ASSOC))
+								$aAppIds[] = (int)$rsApp['IdApplication'];
+						}
+
+						if(!empty($aAppIds) && $sIdRequester != '' && $sIdManager != '')
+						{
+							$sAppIds  = implode(',', $aAppIds);
+							$oResult  = sqlsrv_query($oDbConnection->DBHandle(),
+								"EXECUTE p_SoftwareRequestCreate ?, ?, ?",
+								array($sIdRequester, $sIdManager, $sAppIds));
+
+							if($oResult !== false)
+							{
+								$_SESSION['ErrorCode'] = 'Demande logiciel envoyée au groupe IT';
+							}
+							else
+							{
+								$aSqlErrors = sqlsrv_errors();
+								$sMsg = '';
+								if($aSqlErrors) foreach($aSqlErrors as $e) $sMsg .= $e['message'] . ' ';
+								$_SESSION['ErrorCode'] = 'Error: ' . $sMsg;
+							}
+						}
+						else
+							$_SESSION['ErrorCode'] = 'Error: logiciel introuvable ou données employé manquantes';
+
+						echo '<input hidden="hidden" type="text" id="ErrCde" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+						echo '<input hidden="hidden" type="text" id="ErrMsg" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+
+						$oDbConnection->disconnectSqlDB();
+					}
+					else $_SESSION['ErrorCode'] = 'e10004510 - Connection failed';
+				}
+				else $_SESSION['ErrorCode'] = 'Error: missing user or software';
+			}
+
+			/*** UPDATE-ONBOARDING - Met à jour une ligne existante de dbo.Onboarder ***/
+			/* SCHEMA : table autonome, Team est une colonne texte directe (dbo.Team supprimée) */
+			if($sFormAction == 'update' && $iEmployeeId != -1 && $sFormType == 'onboarding')
+			{
+				$oDbConnection = new cSQLServer();
+				$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+				$oDbConnection->connectSqlDB();
+
+				if($oDbConnection->isConnected())
+				{
+										/* SANITIZE - rejette les valeurs parasites ('', 'undefined') et collapse les espaces */
+					$sTeamName = preg_replace('/\s+/', ' ', trim($sTeamName));
+					if(strtolower($sTeamName) === 'undefined') $sTeamName = '';
+
+					/* Guard duplicate Mail in Onboarder (hors l'employé en cours d'édition) */
+					$iMailDuplicateCount = 0;
+					if($sEmail !== '')
+					{
+						$oMailGuardResult = sqlsrv_query($oDbConnection->DBHandle(),
+							"SELECT COUNT(*) AS Cnt FROM dbo.Onboarder WHERE Mail = ? AND id_employee != ?",
+							array($sEmail, (int)$iEmployeeId));
+						if($oMailGuardResult && ($rsMailGuard = sqlsrv_fetch_array($oMailGuardResult, SQLSRV_FETCH_ASSOC)))
+							$iMailDuplicateCount = (int)$rsMailGuard['Cnt'];
+					}
+
+					if($iMailDuplicateCount > 0)
+					{
+						$_SESSION['ErrorCode'] = 'This email address is already used by another employee and cannot be updated.';
+						echo '<input hidden="hidden" type="text" id="ErrCde" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+						echo '<input hidden="hidden" type="text" id="ErrMsg" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+						$oDbConnection->disconnectSqlDB();
+						exit;
+					}
+
+					$sOnboarderUpdateQuery = "UPDATE dbo.Onboarder SET LastName=?, FirstName=?, AccountName=?, Company=?, Initials=?, JobTitle=?, Team=?, Manager=?, Mail=? WHERE id_employee=?";
+					$aUpdateParams = array($sLastName, $sFirstName, $sAccountName, $sCompany, $sInitials, $sJobTitle, $sTeamName, $sManagerName, $sEmail, (int)$iEmployeeId);
+					$oQueryResult = sqlsrv_query($oDbConnection->DBHandle(), $sOnboarderUpdateQuery, $aUpdateParams);
+
+					if($oQueryResult !== false) $_SESSION['ErrorCode'] = 'e10004501'; /* Success Update */
+					else                   $_SESSION['ErrorCode'] = 'e10004511'; /* Error Update */
+
+					echo '<input hidden="hidden" type="text" id="ErrCde" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+					echo '<input hidden="hidden" type="text" id="ErrMsg" value="' . htmlspecialchars($tErrors[$_SESSION['ErrorCode']] ?? $_SESSION['ErrorCode']) . '">';
+
+					$oDbConnection->disconnectSqlDB();
+				}
+				else $_SESSION['ErrorCode'] = 'e10004511';
+			}
+
+			/*** DELETE-ONBOARDING - Supprime une ligne de dbo.Onboarder ***/
+			/* CASCADE manuelle (transaction) :
+			   - Onboarding : dbo.Notification -> dbo.Approval (FK_Approval_Onboarder, lies par id_employee)
+			   - Software   : demandes du meme employe (SoftwareRequest.IdRequester = AccountName) :
+			                  dbo.Notification -> dbo.Approval -> dbo.SoftwareRequest (lies par IdRequest)
+			   - sTasksBG   : taches de fond "Software approval" fermees (evite les orphelins du badge) */
+			if($sFormAction == 'delete' && $iEmployeeId != -1 && $sFormType == 'onboarding')
+			{
+				$oDbConnection = new cSQLServer();
+				$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+				$oDbConnection->connectSqlDB();
+
+				if($oDbConnection->isConnected())
+				{
+					/* CASCADE manuelle dans une transaction : si une étape échoue, on rollback pour éviter les orphelins */
+					sqlsrv_begin_transaction($oDbConnection->DBHandle());
+
+					$bDelOk = true;
+
+					/* AccountName de l'employe : sert a retrouver ses demandes logiciel (SoftwareRequest.IdRequester) */
+					$sDelAccountName = '';
+					$oAccRes = sqlsrv_query($oDbConnection->DBHandle(),
+						"SELECT AccountName FROM dbo.Onboarder WHERE id_employee = ?",
+						array((int)$iEmployeeId));
+					if($oAccRes === false) $bDelOk = false;
+					else if($rsAcc = sqlsrv_fetch_array($oAccRes, SQLSRV_FETCH_ASSOC))
+						$sDelAccountName = (string)($rsAcc['AccountName'] ?? '');
+
+					/* --- 1. Cote ONBOARDING : approvals lies par id_employee --- */
+					if($bDelOk && sqlsrv_query($oDbConnection->DBHandle(), "DELETE FROM dbo.Notification WHERE id_approval IN (SELECT id_approval FROM dbo.Approval WHERE id_employee=" . (int)$iEmployeeId . ")") === false) $bDelOk = false;
+					if($bDelOk && sqlsrv_query($oDbConnection->DBHandle(), "DELETE FROM dbo.Approval WHERE id_employee=" . (int)$iEmployeeId) === false) $bDelOk = false;
+
+					/* --- 2. Cote SOFTWARE : demandes du meme employe (SoftwareRequest.IdRequester = AccountName) --- */
+					if($bDelOk && $sDelAccountName !== '')
+					{
+						/* 2a. Ferme les taches de fond sTasksBG liees aux demandes (evite les orphelins dans le badge) */
+						if($bDelOk && sqlsrv_query($oDbConnection->DBHandle(),
+							"UPDATE dbo.sTasksBG SET IsComplete = 1, TaskProgress = 100, DTTaskEnd = GETDATE() "
+							. "WHERE TaskName LIKE 'Software approval%' AND IsComplete = 0 "
+							. "AND TRY_CAST(TaskParameter AS INT) IN (SELECT IdRequest FROM dbo.SoftwareRequest WHERE IdRequester = ?)",
+							array($sDelAccountName)) === false) $bDelOk = false;
+
+						/* 2b. Notifications des approvals Software */
+						if($bDelOk && sqlsrv_query($oDbConnection->DBHandle(),
+							"DELETE FROM dbo.Notification WHERE id_approval IN "
+							. "(SELECT id_approval FROM dbo.Approval WHERE IdRequest IN "
+							. "(SELECT IdRequest FROM dbo.SoftwareRequest WHERE IdRequester = ?))",
+							array($sDelAccountName)) === false) $bDelOk = false;
+
+						/* 2c. Approvals Software */
+						if($bDelOk && sqlsrv_query($oDbConnection->DBHandle(),
+							"DELETE FROM dbo.Approval WHERE IdRequest IN "
+							. "(SELECT IdRequest FROM dbo.SoftwareRequest WHERE IdRequester = ?)",
+							array($sDelAccountName)) === false) $bDelOk = false;
+
+						/* 2d. En-tetes SoftwareRequest */
+						if($bDelOk && sqlsrv_query($oDbConnection->DBHandle(),
+							"DELETE FROM dbo.SoftwareRequest WHERE IdRequester = ?",
+							array($sDelAccountName)) === false) $bDelOk = false;
+					}
+
+					/* --- 3. Enfin, l'employe lui-meme --- */
+					if($bDelOk && sqlsrv_query($oDbConnection->DBHandle(), "DELETE FROM dbo.Onboarder WHERE id_employee=" . (int)$iEmployeeId) === false) $bDelOk = false;
+
+					if($bDelOk)
+					{
+						sqlsrv_commit($oDbConnection->DBHandle());
+						$_SESSION['ErrorCode'] = 'e10004502'; /* Success Delete */
+					}
+					else
+					{
+						sqlsrv_rollback($oDbConnection->DBHandle());
+						$_SESSION['ErrorCode'] = 'e10004512'; /* Error Delete */
+					}
+
+					echo '<input hidden="hidden" type="text" id="ErrCde" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+					echo '<input hidden="hidden" type="text" id="ErrMsg" value="' . htmlspecialchars($tErrors[$_SESSION['ErrorCode']] ?? $_SESSION['ErrorCode']) . '">';
+
+					$oDbConnection->disconnectSqlDB();
+				}
+				else $_SESSION['ErrorCode'] = 'e10004512';
+			}
+
+//****************************************************************//
+//*** 6b. TRAITEMENT : APPROBATION LOGICIELS (act=4, approval) ***//
+//****************************************************************//
+
+			/*** APPROVAL-EXECUTE - Appelle la procédure stockée selon l'étape courante ***/
+			/* PARAMS : form=approval&idrequest=X&approvalstep=N&decision=Approved|Pending|Refused&comment=...
+			           &revert=0|1&finalcheck=1,0,1,1,0 (5 valeurs CSV pour etape 3) */
+			if($sFormAction == 'add' && $sFormType == 'approval')
+			{
+				$iIdRequest   = (int)(str_replace("\0", '', trim($_GET['idrequest']    ?? '0')));
+				$iStep        = (int)(str_replace("\0", '', trim($_GET['approvalstep'] ?? '0')));
+				$sDecision    =       str_replace("\0", '', trim($_GET['decision']     ?? ''));
+				$sComment     =       str_replace("\0", '', trim($_GET['comment']      ?? ''));
+				$iRevert      = (int)(str_replace("\0", '', trim($_GET['revert']       ?? '0')));
+				$sFinalCheck  =       str_replace("\0", '', trim($_GET['finalcheck']   ?? ''));
+				$sDecidedBy   = $_SESSION['AccountName'] ?? '';
+
+				$aAllowed = array('Approved', 'Pending', 'Refused');
+
+				/* Choix du SP selon revert ou etape */
+				$sProcName = '';
+				$bUseFinalCheck = false;
+				if($iRevert == 1)
+				{
+					$sProcName = 'p_SoftwareRequestManagerRevert';
+				}
+				else
+				{
+					if($iStep == 1)      $sProcName = 'p_SoftwareRequestIT1Decision';
+					elseif($iStep == 2)  $sProcName = 'p_SoftwareRequestManagerDecision';
+					elseif($iStep == 3) { $sProcName = 'p_SoftwareRequestIT2Decision'; $bUseFinalCheck = true; }
+				}
+
+				if($iIdRequest > 0 && in_array($sDecision, $aAllowed) && $sProcName !== '')
+				{
+					$oDbConnection = new cSQLServer();
+					$oDbConnection->setConnectionParam(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD);
+					$oDbConnection->connectSqlDB();
+
+					if($oDbConnection->isConnected())
+					{
+						if($bUseFinalCheck)
+						{
+							/* Convertit "1,0,1,1,0" en JSON {"1":true,"2":false,...} pour audit */
+							$aChecks = explode(',', $sFinalCheck);
+							$aJson = array();
+							for($i = 0; $i < 5; $i++)
+								$aJson['check_' . ($i+1)] = (isset($aChecks[$i]) && $aChecks[$i] == '1');
+							$sFinalCheckJson = json_encode($aJson);
+
+							$oResult = sqlsrv_query($oDbConnection->DBHandle(),
+								"EXECUTE " . $sProcName . " ?, ?, ?, ?, ?",
+								array($iIdRequest, $sDecision, $sComment, $sDecidedBy, $sFinalCheckJson));
+						}
+						else
+						{
+							$oResult = sqlsrv_query($oDbConnection->DBHandle(),
+								"EXECUTE " . $sProcName . " ?, ?, ?, ?",
+								array($iIdRequest, $sDecision, $sComment, $sDecidedBy));
+						}
+
+						if($oResult !== false)
+						{
+							/* NOTIF - marque les notifications de l'etape traitee, et cree celles de l'etape suivante si workflow avance */
+							markApprovalNotificationsActioned($oDbConnection, $iIdRequest, $iStep);
+							/* Notifications de l'etape suivante deja creees par les SPs de decision (pas de doublon PHP) */
+
+							$_SESSION['ErrorCode'] = ($iRevert == 1 ? 'Decision modifiee : ' : 'Decision enregistree : ') . $sDecision;
+						}
+						else
+						{
+							$aSqlErrors = sqlsrv_errors();
+							$sMsg = '';
+							if($aSqlErrors) foreach($aSqlErrors as $e) $sMsg .= $e['message'] . ' ';
+							$_SESSION['ErrorCode'] = 'Error: ' . $sMsg;
+						}
+
+						echo '<input hidden="hidden" type="text" id="ErrCde" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+						echo '<input hidden="hidden" type="text" id="ErrMsg" value="' . htmlspecialchars($_SESSION['ErrorCode']) . '">';
+
+						$oDbConnection->disconnectSqlDB();
+					}
+					else
+					{
+						echo '<input hidden="hidden" type="text" id="ErrCde" value="e10004510 - Connection failed">';
+						echo '<input hidden="hidden" type="text" id="ErrMsg" value="e10004510 - Connection failed">';
+					}
+				}
+				else
+				{
+					echo '<input hidden="hidden" type="text" id="ErrCde" value="Error: paramètres invalides">';
+					echo '<input hidden="hidden" type="text" id="ErrMsg" value="Error: paramètres invalides">';
+				}
+			}
+		}
+	}
+	else
+	{
+//****************************************************************//
+//*** 7. ACCÈS REFUSÉ (Erreur de permission)                   ***//
+//****************************************************************//
+
+		/* ACCESS-DENIED - Affiché si l'utilisateur n'a pas les droits */
+		echo '<div class="modal-header">';
+			echo '<div class="modal-title fs-5">Access denied</div>';
+			echo '<div class="btn-modal-close" aria-label="Close">X</div>';
+		echo '</div>';
+
+		echo '<div class="modal-body">';
+			echo '<div class="access-denied">Sorry, Access is denied</div>';
+		echo '</div>';
+	}
+	} /* end if(!$bIsAjaxCall) */
+?>
